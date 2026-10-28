@@ -52,41 +52,27 @@ def apply_forces(
     k_mu: float,
 ):
     tid = wp.tid()
-
-    # order threads by cell
     i = wp.hash_grid_point_id(grid, tid)
-
     x = particle_x[i]
     v = particle_v[i]
-
     f = wp.vec3()
-
-    # ground contact
     n = wp.vec3(0.0, 1.0, 0.0)
     c = wp.dot(n, x)
-
-    cohesion_ground = 0.02
-    cohesion_particle = 0.0075
-
-    if c < cohesion_ground:
+    if c < 0.02:
         f = f + contact_force(n, v, c, k_contact, k_damp, 100.0, 0.5)
-
-    # particle contact
+    cutoff = radius * 2.0 + 0.007501
+    cutoff_squared = cutoff * cutoff
     neighbors = wp.hash_grid_query(grid, x, radius * 5.0)
-
     for index in neighbors:
         if index != i:
-            # compute distance to point
             n = x - particle_x[index]
-            d = wp.length(n)
-            err = d - radius * 2.0
-
-            if err <= cohesion_particle:
-                n = n / d
-                vrel = v - particle_v[index]
-
-                f = f + contact_force(n, vrel, err, k_contact, k_damp, k_friction, k_mu)
-
+            if wp.dot(n, n) <= cutoff_squared:
+                d = wp.length(n)
+                err = d - radius * 2.0
+                if err <= 0.0075:
+                    n = n / d
+                    vrel = v - particle_v[index]
+                    f = f + contact_force(n, vrel, err, k_contact, k_damp, k_friction, k_mu)
     particle_f[i] = f
 
 
