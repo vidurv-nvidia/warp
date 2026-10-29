@@ -23,6 +23,8 @@ Use the "num_frames" and "train_iters" keys to control the number of steps.
 Use "test_timeout" to override the default test timeout threshold of 600 seconds.
 """
 
+import importlib.util
+import math
 import os
 import platform
 import subprocess
@@ -30,6 +32,8 @@ import sys
 import tempfile
 import unittest
 from typing import Any
+
+import numpy as np
 
 import warp as wp
 import warp.tests.unittest_utils
@@ -41,6 +45,93 @@ from warp.tests.unittest_utils import (
     get_test_devices,
     sanitize_identifier,
 )
+
+
+def _load_fdtd_example(device, resolution):
+    from warp.examples.core import example_fdtd_3d  # noqa: PLC0415
+
+    name = f"fdtd_test_{device.alias.replace(':', '_')}_{resolution}"
+    spec = importlib.util.spec_from_file_location(name, example_fdtd_3d.__file__)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    module.N_GRID = resolution
+    module.DX = 8.5 / (resolution - 1)
+    module.DT = 0.95 * module.DX / math.sqrt(3.0)
+    module.SOURCE_SCALE = (module.DX_REF / module.DX) ** 2
+    module.SOURCE_IJ = (resolution - 1) // 2
+    module.SOURCE_K = round(1.25 / module.DX)
+    return module
+
+
+def test_fdtd_dispatch(test, device):
+    resolution = 128 if device.is_cuda else 48
+    module = _load_fdtd_example(device, resolution)
+    with wp.ScopedDevice(device):
+        example = module.Example()
+        test.assertIs(example._update_h, module.update_h_128 if device.is_cuda else module.update_h)
+        test.assertIs(example._update_e, module.update_e_128 if device.is_cuda else module.update_e)
+        for name in (
+            "HALF_WIDTH",
+            "R_LENS",
+            "E0",
+            "DX_REF",
+            "SOURCE_RAMP",
+            "DX",
+            "DT",
+            "SOURCE_SCALE",
+            "SOURCE_IJ",
+            "SOURCE_K",
+        ):
+            original = getattr(module, name)
+            setattr(module, name, original + 1)
+            test.assertFalse(module._use_optimized_128(example), name)
+            setattr(module, name, original)
+        if not device.is_cuda:
+            # Compiling the whole module must preserve the generic CPU path.
+            example.step()
+            test.assertEqual(int(example.timestep_counter.numpy()[0]), 1)
+        # A substituted alias must not use the vectorized specialization.
+        example.h_x = example.e_x
+        test.assertFalse(module._use_optimized_128(example))
+
+
+def test_fdtd_update_128(test, device):
+    module = _load_fdtd_example(device, 128)
+    names = ("e_x", "e_y", "e_z", "h_x", "h_y", "h_z")
+    rng = np.random.default_rng(20261029)
+    with wp.ScopedDevice(device):
+        reference = module.Example()
+        candidate = module.Example()
+        for name in names:
+            field = rng.uniform(-0.1, 0.1, (128, 128, 128)).astype(np.float32)
+            getattr(reference, name).assign(field)
+            getattr(candidate, name).assign(field)
+        reference.timestep_counter.fill_(27)
+        candidate.timestep_counter.fill_(27)
+        reference._update_h = module.update_h
+        reference._update_e = module.update_e
+        old = {name: getattr(candidate, name).numpy().copy() for name in names}
+        profiles = {name: getattr(candidate, name).numpy().copy() for name in ("gamma_integer", "gamma_half_offset")}
+        reference.step()
+        candidate.step()
+        i, j, k = np.ogrid[:128, :128, :128]
+        masks = (
+            (i <= 126) & (j >= 1) & (j <= 126) & (k >= 1) & (k <= 126),
+            (i >= 1) & (i <= 126) & (j <= 126) & (k >= 1) & (k <= 126),
+            (i >= 1) & (i <= 126) & (j >= 1) & (j <= 126) & (k <= 126),
+            (j <= 126) & (k <= 126) & np.ones((128, 1, 1), dtype=bool),
+            (i <= 126) & (k <= 126) & np.ones((1, 128, 1), dtype=bool),
+            (i <= 126) & (j <= 126) & np.ones((1, 1, 128), dtype=bool),
+        )
+        for name, active in zip(names, masks, strict=True):
+            actual = getattr(candidate, name).numpy()
+            expected = getattr(reference, name).numpy()
+            np.testing.assert_allclose(actual, expected, rtol=2.0e-6, atol=2.0e-6)
+            test.assertEqual(actual[~active].tobytes(), old[name][~active].tobytes(), name)
+        for name, before in profiles.items():
+            test.assertEqual(getattr(candidate, name).numpy().tobytes(), before.tobytes(), name)
+        test.assertEqual(int(candidate.timestep_counter.numpy()[0]), 28)
 
 
 def _build_command_line_options(test_options: dict[str, Any]) -> list:
@@ -402,6 +493,11 @@ add_example_test(
     devices=cuda_test_devices,
 )
 
+
+add_function_test(TestCoreExamples, "test_fdtd_dispatch", test_fdtd_dispatch, devices=test_devices, check_output=False)
+add_function_test(
+    TestCoreExamples, "test_fdtd_update_128", test_fdtd_update_128, devices=cuda_test_devices, check_output=False
+)
 
 if __name__ == "__main__":
     # force rebuild of all kernels

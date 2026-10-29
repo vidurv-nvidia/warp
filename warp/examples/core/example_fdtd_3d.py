@@ -59,6 +59,7 @@ Usage:
     python example_fdtd_3d.py
 """
 
+import itertools
 import math
 
 import numpy as np
@@ -230,6 +231,470 @@ def update_e(
         e_z[i, j, k] = new_e_z
 
 
+# The specialized kernels retain the fixed physical constants of the 128-node example.
+HALF_WIDTH_128 = 4.25
+N_GRID_128 = 128
+DX_128 = 2.0 * HALF_WIDTH_128 / (N_GRID_128 - 1)
+DT_128 = 0.95 * DX_128 / math.sqrt(3.0)
+
+
+@wp.func_native(
+    snippet="""
+#if defined(__CUDA_ARCH__)
+    return static_cast<wp::int32>(blockIdx.x * blockDim.x + threadIdx.x);
+#else
+    return -1;
+#endif
+"""
+)
+def native_linear_thread_index() -> int: ...
+
+
+@wp.func
+def loss_coeffs_128(gamma: float) -> tuple[float, float]:
+    gamma_dt_half = 0.5 * DT_128 * gamma
+    return ((1.0 - gamma_dt_half) / (1.0 + gamma_dt_half), 1.0 / (1.0 + gamma_dt_half))
+
+
+@wp.kernel(grid_stride=False)
+def update_h_128(
+    e_x: wp.array3d[float],
+    e_y: wp.array3d[float],
+    e_z: wp.array3d[float],
+    gamma_integer: wp.array[float],
+    gamma_half_offset: wp.array[float],
+    h_x: wp.array3d[float],
+    h_y: wp.array3d[float],
+    h_z: wp.array3d[float],
+):
+    packed = native_linear_thread_index()
+    if packed < 0:
+        launch_i, launch_j, launch_k = wp.tid()
+        packed = (launch_i * N_GRID_128 + launch_j) * N_GRID_128 + launch_k
+    if packed >= N_GRID_128 * N_GRID_128 * N_GRID_128 // 2:
+        return
+    linear = packed << 1
+    i = packed >> 13
+    j = (packed >> 6) & (N_GRID_128 - 1)
+    k = (packed & (N_GRID_128 // 2 - 1)) << 1
+    ex_flat = wp.array(ptr=e_x.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128,), dtype=wp.float32)
+    ey_flat = wp.array(ptr=e_y.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128,), dtype=wp.float32)
+    integer_flat = wp.array(ptr=gamma_integer.ptr, shape=(N_GRID_128,), dtype=wp.float32)
+    half_flat = wp.array(ptr=gamma_half_offset.ptr, shape=(N_GRID_128,), dtype=wp.float32)
+    dt_dx = DT_128 / DX_128
+    last_staggered = N_GRID_128 - 2
+    i_next_word = packed + wp.min(1, N_GRID_128 - 1 - i) * (N_GRID_128 * N_GRID_128 // 2)
+    j_next_word = packed + wp.min(1, N_GRID_128 - 1 - j) * (N_GRID_128 // 2)
+    k_next_scalar = linear + wp.min(2, N_GRID_128 - 1 - k)
+    ex_words = wp.array(ptr=e_x.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    ey_words = wp.array(ptr=e_y.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    ez_words = wp.array(ptr=e_z.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    hx_words = wp.array(ptr=h_x.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    hy_words = wp.array(ptr=h_y.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    hz_words = wp.array(ptr=h_z.ptr, shape=(N_GRID_128 * N_GRID_128 * N_GRID_128 // 2,), dtype=wp.uint64)
+    ex_center = wp.cast(ex_words[packed], wp.vec2)
+    ey_center = wp.cast(ey_words[packed], wp.vec2)
+    ez_center = wp.cast(ez_words[packed], wp.vec2)
+    gamma_i = integer_flat[i]
+    gamma_j = integer_flat[j]
+    integer_words = wp.array(ptr=gamma_integer.ptr, shape=(N_GRID_128 // 2,), dtype=wp.uint64)
+    half_words = wp.array(ptr=gamma_half_offset.ptr, shape=(N_GRID_128 // 2,), dtype=wp.uint64)
+    gamma_k_pair = wp.cast(integer_words[k >> 1], wp.vec2)
+    half_k_pair = wp.cast(half_words[k >> 1], wp.vec2)
+    gamma_k_0 = gamma_k_pair[0]
+    gamma_k_1 = gamma_k_pair[1]
+    half_i = half_flat[i]
+    half_j = half_flat[j]
+    half_k_0 = half_k_pair[0]
+    half_k_1 = half_k_pair[1]
+    ez_j_next = wp.cast(ez_words[j_next_word], wp.vec2)
+    ey_k_last = ey_flat[k_next_scalar]
+    hx_old = wp.cast(hx_words[packed], wp.vec2)
+    a_x_0, b_x_0 = loss_coeffs_128(gamma_i + half_j + half_k_0)
+    a_x_1, b_x_1 = loss_coeffs_128(gamma_i + half_j + half_k_1)
+    curl_x_0 = ez_j_next[0] - ez_center[0] - (ey_center[1] - ey_center[0])
+    curl_x_1 = ez_j_next[1] - ez_center[1] - (ey_k_last - ey_center[1])
+    hx_next_0 = a_x_0 * hx_old[0] - b_x_0 * dt_dx * curl_x_0
+    hx_candidate_1 = a_x_1 * hx_old[1] - b_x_1 * dt_dx * curl_x_1
+    hx_next_1 = hx_old[1]
+    if k + 1 <= last_staggered:
+        hx_next_1 = hx_candidate_1
+    if j <= last_staggered:
+        hx_words[packed] = wp.cast(wp.vec2(hx_next_0, hx_next_1), wp.uint64)
+    ez_i_next = wp.cast(ez_words[i_next_word], wp.vec2)
+    ex_k_last = ex_flat[k_next_scalar]
+    hy_old = wp.cast(hy_words[packed], wp.vec2)
+    a_y_0, b_y_0 = loss_coeffs_128(half_i + gamma_j + half_k_0)
+    a_y_1, b_y_1 = loss_coeffs_128(half_i + gamma_j + half_k_1)
+    curl_y_0 = ex_center[1] - ex_center[0] - (ez_i_next[0] - ez_center[0])
+    curl_y_1 = ex_k_last - ex_center[1] - (ez_i_next[1] - ez_center[1])
+    hy_next_0 = a_y_0 * hy_old[0] - b_y_0 * dt_dx * curl_y_0
+    hy_candidate_1 = a_y_1 * hy_old[1] - b_y_1 * dt_dx * curl_y_1
+    hy_next_1 = hy_old[1]
+    if k + 1 <= last_staggered:
+        hy_next_1 = hy_candidate_1
+    if i <= last_staggered:
+        hy_words[packed] = wp.cast(wp.vec2(hy_next_0, hy_next_1), wp.uint64)
+    ey_i_next = wp.cast(ey_words[i_next_word], wp.vec2)
+    ex_j_next = wp.cast(ex_words[j_next_word], wp.vec2)
+    hz_old = wp.cast(hz_words[packed], wp.vec2)
+    a_z_0, b_z_0 = loss_coeffs_128(half_i + half_j + gamma_k_0)
+    a_z_1, b_z_1 = loss_coeffs_128(half_i + half_j + gamma_k_1)
+    curl_z_0 = ey_i_next[0] - ey_center[0] - (ex_j_next[0] - ex_center[0])
+    curl_z_1 = ey_i_next[1] - ey_center[1] - (ex_j_next[1] - ex_center[1])
+    hz_next_0 = a_z_0 * hz_old[0] - b_z_0 * dt_dx * curl_z_0
+    hz_next_1 = a_z_1 * hz_old[1] - b_z_1 * dt_dx * curl_z_1
+    if i <= last_staggered and j <= last_staggered:
+        hz_words[packed] = wp.cast(wp.vec2(hz_next_0, hz_next_1), wp.uint64)
+
+
+@wp.kernel(grid_stride=False, launch_bounds=(256, 4), enable_cuda_smem_spilling=True)
+def update_e_128(
+    h_x: wp.array3d[float],
+    h_y: wp.array3d[float],
+    h_z: wp.array3d[float],
+    gamma_integer: wp.array[float],
+    gamma_half_offset: wp.array[float],
+    timestep_counter: wp.array[wp.int32],
+    e_x: wp.array3d[float],
+    e_y: wp.array3d[float],
+    e_z: wp.array3d[float],
+):
+    alignment_bits = (
+        h_x.ptr | h_y.ptr | h_z.ptr | e_x.ptr | e_y.ptr | e_z.ptr | gamma_integer.ptr | gamma_half_offset.ptr
+    )
+    if h_x.shape[0] == 128 and (alignment_bits & wp.uint64(15)) == wp.uint64(0):
+        aligned_launch_x, aligned_launch_y, aligned_launch_z = wp.tid()
+        aligned_grid_size = h_x.shape[0]
+        if aligned_launch_x >= aligned_grid_size // 8:
+            return
+
+        aligned_tile_index = (
+            aligned_launch_x * aligned_grid_size + aligned_launch_y
+        ) * aligned_grid_size + aligned_launch_z
+        aligned_index_x = aligned_tile_index >> 11
+        aligned_first_y = ((aligned_tile_index >> 5) & 63) << 1
+        aligned_first_z = (aligned_tile_index & 31) << 2
+        aligned_last = aligned_grid_size - 2
+        if aligned_index_x > aligned_last:
+            return
+
+        aligned_dx = float(0.06692913385826772)
+        aligned_dt = float(0.036709475777214395)
+        aligned_dt_dx = float(0.5484827756881714)
+        aligned_source_scale = float(0.24804306036139942)
+        aligned_source_k = int(19)
+        aligned_vector_z_size = aligned_grid_size // 4
+        aligned_volume = aligned_grid_size * aligned_grid_size * aligned_grid_size
+        aligned_vector_volume = aligned_volume // 4
+        aligned_first_vector_index = (aligned_index_x * aligned_grid_size + aligned_first_y) * aligned_vector_z_size + (
+            aligned_first_z >> 2
+        )
+        aligned_vector_h_x = wp.array(ptr=(h_x.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_vector_h_y = wp.array(ptr=(h_y.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_vector_h_z = wp.array(ptr=(h_z.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_vector_e_x = wp.array(ptr=(e_x.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_vector_e_y = wp.array(ptr=(e_y.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_vector_e_z = wp.array(ptr=(e_z.ptr & ~wp.uint64(15)), shape=(aligned_vector_volume,), dtype=wp.vec4)
+        aligned_flat_h_x = wp.array(ptr=h_x.ptr, shape=(aligned_volume,), dtype=float)
+        aligned_flat_h_y = wp.array(ptr=h_y.ptr, shape=(aligned_volume,), dtype=float)
+        aligned_node_profile = wp.array(ptr=gamma_integer.ptr, shape=(aligned_grid_size,), dtype=float)
+        aligned_half_profile = wp.array(ptr=gamma_half_offset.ptr, shape=(aligned_grid_size,), dtype=float)
+        aligned_vector_node_profile = wp.array(
+            ptr=(gamma_integer.ptr & ~wp.uint64(15)), shape=(aligned_vector_z_size,), dtype=wp.vec4
+        )
+        aligned_vector_half_profile = wp.array(
+            ptr=(gamma_half_offset.ptr & ~wp.uint64(15)), shape=(aligned_vector_z_size,), dtype=wp.vec4
+        )
+
+        aligned_previous_vector_y = aligned_first_vector_index - wp.where(aligned_first_y > 0, aligned_vector_z_size, 0)
+        aligned_h_x_previous_y = aligned_vector_h_x[aligned_previous_vector_y]
+        aligned_h_z_previous_y = aligned_vector_h_z[aligned_previous_vector_y]
+        aligned_gamma_node_x = aligned_node_profile[aligned_index_x]
+        aligned_gamma_half_x = aligned_half_profile[aligned_index_x]
+        aligned_gamma_nodes_z = aligned_vector_node_profile[aligned_first_z >> 2]
+        aligned_gamma_halves_z = aligned_vector_half_profile[aligned_first_z >> 2]
+        aligned_half_dt = 0.5 * aligned_dt
+        aligned_half_dx = 0.5 * aligned_dx
+        aligned_x_node = float(aligned_index_x) * aligned_dx - 4.25
+        aligned_x_half = aligned_x_node + aligned_half_dx
+        aligned_source_ij = (aligned_grid_size - 1) // 2
+
+        for aligned_row_offset in range(2):
+            aligned_row = wp.static(aligned_row_offset)
+            aligned_index_y = aligned_first_y + aligned_row
+            if aligned_index_y <= aligned_last:
+                aligned_vector_index = aligned_first_vector_index + aligned_row * aligned_vector_z_size
+                aligned_previous_vector_x = aligned_vector_index - wp.where(
+                    aligned_index_x > 0, aligned_grid_size * aligned_vector_z_size, 0
+                )
+                aligned_previous_scalar_z = (aligned_vector_index << 2) - wp.where(aligned_first_z > 0, 1, 0)
+                aligned_h_x_values = aligned_vector_h_x[aligned_vector_index]
+                aligned_h_y_values = aligned_vector_h_y[aligned_vector_index]
+                aligned_h_z_values = aligned_vector_h_z[aligned_vector_index]
+                aligned_h_y_previous_x = aligned_vector_h_y[aligned_previous_vector_x]
+                aligned_h_z_previous_x = aligned_vector_h_z[aligned_previous_vector_x]
+                aligned_h_x_previous_z = aligned_flat_h_x[aligned_previous_scalar_z]
+                aligned_h_y_previous_z = aligned_flat_h_y[aligned_previous_scalar_z]
+                aligned_e_x_values = aligned_vector_e_x[aligned_vector_index]
+                aligned_e_y_values = aligned_vector_e_y[aligned_vector_index]
+                aligned_e_z_values = aligned_vector_e_z[aligned_vector_index]
+
+                aligned_curl_x_values = wp.vec4()
+                aligned_curl_y_values = wp.vec4()
+                aligned_curl_z_values = (
+                    aligned_h_y_values - aligned_h_y_previous_x - (aligned_h_x_values - aligned_h_x_previous_y)
+                )
+                for aligned_curl_offset in range(4):
+                    aligned_curl_cell = wp.static(aligned_curl_offset)
+                    aligned_curl_x_values[aligned_curl_cell] = (
+                        aligned_h_z_values[aligned_curl_cell]
+                        - aligned_h_z_previous_y[aligned_curl_cell]
+                        - (aligned_h_y_values[aligned_curl_cell] - aligned_h_y_previous_z)
+                    )
+                    aligned_curl_y_values[aligned_curl_cell] = (
+                        aligned_h_x_values[aligned_curl_cell]
+                        - aligned_h_x_previous_z
+                        - (aligned_h_z_values[aligned_curl_cell] - aligned_h_z_previous_x[aligned_curl_cell])
+                    )
+                    aligned_h_x_previous_z = aligned_h_x_values[aligned_curl_cell]
+                    aligned_h_y_previous_z = aligned_h_y_values[aligned_curl_cell]
+
+                aligned_gamma_node_y = aligned_node_profile[aligned_index_y]
+                aligned_gamma_half_y = aligned_half_profile[aligned_index_y]
+                aligned_gamma_xy_x = aligned_gamma_half_x + aligned_gamma_node_y
+                aligned_gamma_xy_y = aligned_gamma_node_x + aligned_gamma_half_y
+                aligned_gamma_xy_z = aligned_gamma_node_x + aligned_gamma_node_y
+                aligned_y_node = float(aligned_index_y) * aligned_dx - 4.25
+                aligned_y_half = aligned_y_node + aligned_half_dx
+                aligned_radius_xy_x = aligned_x_half * aligned_x_half + aligned_y_node * aligned_y_node
+                aligned_radius_xy_y = aligned_x_node * aligned_x_node + aligned_y_half * aligned_y_half
+                aligned_radius_xy_z = aligned_x_node * aligned_x_node + aligned_y_node * aligned_y_node
+
+                aligned_is_source_vector = (
+                    aligned_index_x == aligned_source_ij
+                    and aligned_index_y == aligned_source_ij
+                    and aligned_first_z <= aligned_source_k
+                    and aligned_source_k < aligned_first_z + 4
+                )
+                aligned_source = float(0.0)
+                if aligned_is_source_vector:
+                    aligned_source_time = (float(timestep_counter[0]) + 0.5) * aligned_dt
+                    aligned_source = (
+                        -aligned_source_scale
+                        * wp.sin(2.0 * wp.pi * aligned_source_time)
+                        * (1.0 - wp.exp(-((aligned_source_time / 3.0) ** 2.0)))
+                    )
+
+                for aligned_cell_offset in range(4):
+                    aligned_cell = wp.static(aligned_cell_offset)
+                    aligned_index_z = aligned_first_z + aligned_cell
+                    if aligned_index_z <= aligned_last:
+                        aligned_gamma_dt_x = aligned_half_dt * (
+                            aligned_gamma_xy_x + aligned_gamma_nodes_z[aligned_cell]
+                        )
+                        aligned_gamma_dt_y = aligned_half_dt * (
+                            aligned_gamma_xy_y + aligned_gamma_nodes_z[aligned_cell]
+                        )
+                        aligned_gamma_dt_z = aligned_half_dt * (
+                            aligned_gamma_xy_z + aligned_gamma_halves_z[aligned_cell]
+                        )
+                        aligned_b_x = wp.div_approx(1.0, 1.0 + aligned_gamma_dt_x)
+                        aligned_b_y = wp.div_approx(1.0, 1.0 + aligned_gamma_dt_y)
+                        aligned_b_z = wp.div_approx(1.0, 1.0 + aligned_gamma_dt_z)
+                        aligned_a_x = (1.0 - aligned_gamma_dt_x) * aligned_b_x
+                        aligned_a_y = (1.0 - aligned_gamma_dt_y) * aligned_b_y
+                        aligned_a_z = (1.0 - aligned_gamma_dt_z) * aligned_b_z
+
+                        aligned_z_node = float(aligned_index_z) * aligned_dx - 4.25
+                        aligned_z_half = aligned_z_node + aligned_half_dx
+                        aligned_radius_x = aligned_radius_xy_x + aligned_z_node * aligned_z_node
+                        aligned_radius_y = aligned_radius_xy_y + aligned_z_node * aligned_z_node
+                        aligned_radius_z = aligned_radius_xy_z + aligned_z_half * aligned_z_half
+                        aligned_inv_eps_x = float(1.0)
+                        aligned_inv_eps_y = float(1.0)
+                        aligned_inv_eps_z = float(1.0)
+                        if aligned_radius_x < 9.0:
+                            aligned_inv_eps_x = wp.div_approx(1.0, 2.0 - aligned_radius_x / 9.0)
+                        if aligned_radius_y < 9.0:
+                            aligned_inv_eps_y = wp.div_approx(1.0, 2.0 - aligned_radius_y / 9.0)
+                        if aligned_radius_z < 9.0:
+                            aligned_inv_eps_z = wp.div_approx(1.0, 2.0 - aligned_radius_z / 9.0)
+
+                        aligned_curl_x = aligned_curl_x_values[aligned_cell]
+                        aligned_curl_y = aligned_curl_y_values[aligned_cell]
+                        aligned_curl_z = aligned_curl_z_values[aligned_cell]
+                        if aligned_is_source_vector and aligned_index_z == aligned_source_k:
+                            aligned_curl_x -= aligned_source
+                        if aligned_index_y >= 1 and aligned_index_z >= 1:
+                            aligned_e_x_values[aligned_cell] = (
+                                aligned_a_x * aligned_e_x_values[aligned_cell]
+                                + aligned_b_x * aligned_dt_dx * aligned_inv_eps_x * aligned_curl_x
+                            )
+                        if aligned_index_x >= 1 and aligned_index_z >= 1:
+                            aligned_e_y_values[aligned_cell] = (
+                                aligned_a_y * aligned_e_y_values[aligned_cell]
+                                + aligned_b_y * aligned_dt_dx * aligned_inv_eps_y * aligned_curl_y
+                            )
+                        if aligned_index_x >= 1 and aligned_index_y >= 1:
+                            aligned_e_z_values[aligned_cell] = (
+                                aligned_a_z * aligned_e_z_values[aligned_cell]
+                                + aligned_b_z * aligned_dt_dx * aligned_inv_eps_z * aligned_curl_z
+                            )
+
+                if aligned_index_y >= 1:
+                    aligned_vector_e_x[aligned_vector_index] = aligned_e_x_values
+                if aligned_index_x >= 1:
+                    aligned_vector_e_y[aligned_vector_index] = aligned_e_y_values
+                if aligned_index_x >= 1 and aligned_index_y >= 1:
+                    aligned_vector_e_z[aligned_vector_index] = aligned_e_z_values
+                aligned_h_x_previous_y = aligned_h_x_values
+                aligned_h_z_previous_y = aligned_h_z_values
+    else:
+        launch_x, launch_y, launch_z = wp.tid()
+        grid_size = h_x.shape[0]
+        if launch_x >= grid_size // 2:
+            return
+
+        vector_index = (launch_x * grid_size + launch_y) * grid_size + launch_z
+        vector_row_shift = int(5)
+        vector_plane_shift = int(11)
+        vector_z_mask = int(31)
+        grid_mask = int(63)
+        dx = float(0.1349206349206349)
+        dt = float(0.0740016416461306)
+        dt_dx = float(0.5484827160835266)
+        source_scale = float(0.06103806228373703)
+        source_k = int(9)
+        if grid_size == 128:
+            vector_row_shift = 6
+            vector_plane_shift = 13
+            vector_z_mask = 63
+            grid_mask = 127
+            dx = 0.06692913385826772
+            dt = 0.036709475777214395
+            dt_dx = 0.5484827756881714
+            source_scale = 0.24804306036139942
+            source_k = 19
+
+        index_x = vector_index >> vector_plane_shift
+        index_y = (vector_index >> vector_row_shift) & grid_mask
+        first_z = (vector_index & vector_z_mask) << 1
+        last = grid_size - 2
+        if index_x > last or index_y > last:
+            return
+
+        vector_z_size = grid_size // 2
+        volume = grid_size * grid_size * grid_size
+        vector_volume = volume // 2
+        vector_h_x = wp.array(ptr=h_x.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        vector_h_y = wp.array(ptr=h_y.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        vector_h_z = wp.array(ptr=h_z.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        vector_e_x = wp.array(ptr=e_x.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        vector_e_y = wp.array(ptr=e_y.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        vector_e_z = wp.array(ptr=e_z.ptr, shape=(vector_volume,), dtype=wp.uint64)
+        flat_h_x = wp.array(ptr=h_x.ptr, shape=(volume,), dtype=float)
+        flat_h_y = wp.array(ptr=h_y.ptr, shape=(volume,), dtype=float)
+        node_profile = wp.array(ptr=gamma_integer.ptr, shape=(grid_size,), dtype=float)
+        half_profile = wp.array(ptr=gamma_half_offset.ptr, shape=(grid_size,), dtype=float)
+        vector_node_profile = wp.array(ptr=gamma_integer.ptr, shape=(vector_z_size,), dtype=wp.uint64)
+        vector_half_profile = wp.array(ptr=gamma_half_offset.ptr, shape=(vector_z_size,), dtype=wp.uint64)
+
+        previous_vector_x = vector_index - wp.where(index_x > 0, grid_size * vector_z_size, 0)
+        previous_vector_y = vector_index - wp.where(index_y > 0, vector_z_size, 0)
+        previous_scalar_z = (vector_index << 1) - wp.where(first_z > 0, 1, 0)
+        h_x_values = wp.cast(vector_h_x[vector_index], wp.vec2)
+        h_y_values = wp.cast(vector_h_y[vector_index], wp.vec2)
+        h_z_values = wp.cast(vector_h_z[vector_index], wp.vec2)
+        h_x_previous_y = wp.cast(vector_h_x[previous_vector_y], wp.vec2)
+        h_y_previous_x = wp.cast(vector_h_y[previous_vector_x], wp.vec2)
+        h_z_previous_x = wp.cast(vector_h_z[previous_vector_x], wp.vec2)
+        h_z_previous_y = wp.cast(vector_h_z[previous_vector_y], wp.vec2)
+        h_x_previous_z = flat_h_x[previous_scalar_z]
+        h_y_previous_z = flat_h_y[previous_scalar_z]
+        e_x_values = wp.cast(vector_e_x[vector_index], wp.vec2)
+        e_y_values = wp.cast(vector_e_y[vector_index], wp.vec2)
+        e_z_values = wp.cast(vector_e_z[vector_index], wp.vec2)
+
+        gamma_node_x = node_profile[index_x]
+        gamma_node_y = node_profile[index_y]
+        gamma_half_x = half_profile[index_x]
+        gamma_half_y = half_profile[index_y]
+        gamma_nodes_z = wp.cast(vector_node_profile[first_z >> 1], wp.vec2)
+        gamma_halves_z = wp.cast(vector_half_profile[first_z >> 1], wp.vec2)
+        gamma_xy_x = gamma_half_x + gamma_node_y
+        gamma_xy_y = gamma_node_x + gamma_half_y
+        gamma_xy_z = gamma_node_x + gamma_node_y
+        half_dt = 0.5 * dt
+        half_dx = 0.5 * dx
+        x_node = float(index_x) * dx - 4.25
+        y_node = float(index_y) * dx - 4.25
+        x_half = x_node + half_dx
+        y_half = y_node + half_dx
+        radius_xy_x = x_half * x_half + y_node * y_node
+        radius_xy_y = x_node * x_node + y_half * y_half
+        radius_xy_z = x_node * x_node + y_node * y_node
+
+        source_ij = (grid_size - 1) // 2
+        is_source_vector = (
+            index_x == source_ij and index_y == source_ij and first_z <= source_k and source_k < first_z + 2
+        )
+        source = float(0.0)
+        if is_source_vector:
+            source_time = (float(timestep_counter[0]) + 0.5) * dt
+            source = -source_scale * wp.sin(2.0 * wp.pi * source_time) * (1.0 - wp.exp(-((source_time / 3.0) ** 2.0)))
+
+        for cell_offset in range(2):
+            cell = wp.static(cell_offset)
+            index_z = first_z + cell
+            if index_z <= last:
+                gamma_dt_x = half_dt * (gamma_xy_x + gamma_nodes_z[cell])
+                gamma_dt_y = half_dt * (gamma_xy_y + gamma_nodes_z[cell])
+                gamma_dt_z = half_dt * (gamma_xy_z + gamma_halves_z[cell])
+                b_x = wp.div_approx(1.0, 1.0 + gamma_dt_x)
+                b_y = wp.div_approx(1.0, 1.0 + gamma_dt_y)
+                b_z = wp.div_approx(1.0, 1.0 + gamma_dt_z)
+                a_x = (1.0 - gamma_dt_x) * b_x
+                a_y = (1.0 - gamma_dt_y) * b_y
+                a_z = (1.0 - gamma_dt_z) * b_z
+
+                z_node = float(index_z) * dx - 4.25
+                z_half = z_node + half_dx
+                radius_x = radius_xy_x + z_node * z_node
+                radius_y = radius_xy_y + z_node * z_node
+                radius_z = radius_xy_z + z_half * z_half
+                inv_eps_x = float(1.0)
+                inv_eps_y = float(1.0)
+                inv_eps_z = float(1.0)
+                if radius_x < 9.0:
+                    inv_eps_x = wp.div_approx(1.0, 2.0 - radius_x / 9.0)
+                if radius_y < 9.0:
+                    inv_eps_y = wp.div_approx(1.0, 2.0 - radius_y / 9.0)
+                if radius_z < 9.0:
+                    inv_eps_z = wp.div_approx(1.0, 2.0 - radius_z / 9.0)
+
+                curl_x = h_z_values[cell] - h_z_previous_y[cell] - (h_y_values[cell] - h_y_previous_z)
+                curl_y = h_x_values[cell] - h_x_previous_z - (h_z_values[cell] - h_z_previous_x[cell])
+                curl_z = h_y_values[cell] - h_y_previous_x[cell] - (h_x_values[cell] - h_x_previous_y[cell])
+                if is_source_vector and index_z == source_k:
+                    curl_x -= source
+                if index_y >= 1 and index_z >= 1:
+                    e_x_values[cell] = a_x * e_x_values[cell] + b_x * dt_dx * inv_eps_x * curl_x
+                if index_x >= 1 and index_z >= 1:
+                    e_y_values[cell] = a_y * e_y_values[cell] + b_y * dt_dx * inv_eps_y * curl_y
+                if index_x >= 1 and index_y >= 1:
+                    e_z_values[cell] = a_z * e_z_values[cell] + b_z * dt_dx * inv_eps_z * curl_z
+            h_x_previous_z = h_x_values[cell]
+            h_y_previous_z = h_y_values[cell]
+
+        if index_y >= 1:
+            vector_e_x[vector_index] = wp.cast(e_x_values, wp.uint64)
+        if index_x >= 1:
+            vector_e_y[vector_index] = wp.cast(e_y_values, wp.uint64)
+        if index_x >= 1 and index_y >= 1:
+            vector_e_z[vector_index] = wp.cast(e_z_values, wp.uint64)
+
+
 @wp.kernel
 def compute_em_energy(
     e_x: wp.array3d[float],
@@ -301,6 +766,42 @@ def build_loss_profiles() -> tuple[wp.array[float], wp.array[float]]:
     return gamma_integer, gamma_half_offset
 
 
+def _use_optimized_128(example) -> bool:
+    """Select the CUDA specialization only for its fixed physical configuration."""
+    expected_dx = 8.5 / 127
+    expected_dt = 0.95 * expected_dx / math.sqrt(3.0)
+    if not (
+        N_GRID == N_GRID_128 == 128
+        and HALF_WIDTH == HALF_WIDTH_128 == 4.25
+        and R_LENS == 3.0
+        and E0 == 1.0
+        and DX_REF == 1.0 / 30.0
+        and SOURCE_RAMP == 3.0
+        and DX == DX_128 == expected_dx
+        and DT == DT_128 == expected_dt
+        and SOURCE_SCALE == ((1.0 / 30.0) / expected_dx) ** 2
+        and SOURCE_IJ == 63
+        and SOURCE_K == 19
+    ):
+        return False
+    fields = (example.e_x, example.e_y, example.e_z, example.h_x, example.h_y, example.h_z)
+    profiles = (example.gamma_integer, example.gamma_half_offset)
+    arrays = fields + profiles
+    device = fields[0].device
+    if not device.is_cuda:
+        return False
+    for array in arrays:
+        if array.device != device or array.dtype != wp.float32 or not array.is_contiguous or array.ptr % 16:
+            return False
+    if any(array.shape != (128, 128, 128) for array in fields):
+        return False
+    if any(array.shape != (128,) for array in profiles):
+        return False
+    # The native constructor owns separate allocations; reject substituted aliases.
+    spans = sorted((array.ptr, array.ptr + array.size * 4) for array in arrays)
+    return all(left[1] <= right[0] for left, right in itertools.pairwise(spans))
+
+
 class Example:
     """FDTD solver for a point source collimated by a Luneburg lens.
 
@@ -334,6 +835,10 @@ class Example:
         # the three axes index the same integer and half-offset profiles for a cubic uniform grid
         self.gamma_integer, self.gamma_half_offset = build_loss_profiles()
 
+        optimized = _use_optimized_128(self)
+        self._update_h = update_h_128 if optimized else update_h
+        self._update_e = update_e_128 if optimized else update_e
+
         points_per_wavelength = (N_GRID - 1) / (2.0 * HALF_WIDTH)
         print(
             f"FDTD Luneburg lens: {N_GRID}^3 grid, dx = {DX:.6f} "
@@ -360,14 +865,14 @@ class Example:
     def step(self) -> None:
         """Advance ``H`` from curl ``E``, then ``E`` from curl ``H`` in leapfrog fashion."""
         wp.launch(
-            update_h,
+            self._update_h,
             dim=(N_GRID, N_GRID, N_GRID),
             inputs=[self.e_x, self.e_y, self.e_z, self.gamma_integer, self.gamma_half_offset],
             outputs=[self.h_x, self.h_y, self.h_z],
         )
 
         wp.launch(
-            update_e,
+            self._update_e,
             dim=(N_GRID, N_GRID, N_GRID),
             inputs=[
                 self.h_x,
