@@ -70,6 +70,264 @@ def integrate_bodies_tiled(
     new_position[i] = old_position[i] + DT * velocity[i]
 
 
+# Reuse a shared source tile across 64 targets and expose 32 independent
+# interaction calculations before accumulating them in the original order.
+SOURCE_TILE_SIZE = wp.constant(256)
+
+
+# Keep the generated compilation options local to this kernel so that the
+# original generic kernel retains its compilation and differentiation behavior.
+@wp.kernel(
+    launch_bounds=(64, 4),
+    module="unique",
+    module_options={"block_dim": 64, "max_unroll": 1, "enable_backward": False, "fast_math": False},
+)
+def _integrate_bodies_tiled_optimized(
+    old_position: wp.array[wp.vec3],
+    velocity: wp.array[wp.vec3],
+    new_position: wp.array[wp.vec3],
+    num_bodies: int,
+):
+    body_index = wp.tid()
+    position = old_position[body_index]
+    acceleration = wp.vec3(0.0, 0.0, 0.0)
+
+    source_tiles = num_bodies / TILE_SIZE
+    for tile_index in range((source_tiles + 3) / 4):
+        positions = wp.tile_load(
+            old_position, shape=SOURCE_TILE_SIZE, offset=tile_index * SOURCE_TILE_SIZE, storage="shared"
+        )
+        source_groups = wp.min(4, source_tiles - tile_index * 4) * 2
+        for group_index in range(source_groups):
+            source_index = group_index * 32
+            displacement0 = positions[source_index] - position
+            displacement1 = positions[source_index + 1] - position
+            displacement2 = positions[source_index + 2] - position
+            displacement3 = positions[source_index + 3] - position
+            displacement4 = positions[source_index + 4] - position
+            displacement5 = positions[source_index + 5] - position
+            displacement6 = positions[source_index + 6] - position
+            displacement7 = positions[source_index + 7] - position
+            displacement8 = positions[source_index + 8] - position
+            displacement9 = positions[source_index + 9] - position
+            displacement10 = positions[source_index + 10] - position
+            displacement11 = positions[source_index + 11] - position
+            displacement12 = positions[source_index + 12] - position
+            displacement13 = positions[source_index + 13] - position
+            displacement14 = positions[source_index + 14] - position
+            displacement15 = positions[source_index + 15] - position
+            displacement16 = positions[source_index + 16] - position
+            displacement17 = positions[source_index + 17] - position
+            displacement18 = positions[source_index + 18] - position
+            displacement19 = positions[source_index + 19] - position
+            displacement20 = positions[source_index + 20] - position
+            displacement21 = positions[source_index + 21] - position
+            displacement22 = positions[source_index + 22] - position
+            displacement23 = positions[source_index + 23] - position
+            displacement24 = positions[source_index + 24] - position
+            displacement25 = positions[source_index + 25] - position
+            displacement26 = positions[source_index + 26] - position
+            displacement27 = positions[source_index + 27] - position
+            displacement28 = positions[source_index + 28] - position
+            displacement29 = positions[source_index + 29] - position
+            displacement30 = positions[source_index + 30] - position
+            displacement31 = positions[source_index + 31] - position
+            distance0 = wp.length_sq(displacement0) + SOFTENING_SQ
+            distance1 = wp.length_sq(displacement1) + SOFTENING_SQ
+            distance2 = wp.length_sq(displacement2) + SOFTENING_SQ
+            distance3 = wp.length_sq(displacement3) + SOFTENING_SQ
+            distance4 = wp.length_sq(displacement4) + SOFTENING_SQ
+            distance5 = wp.length_sq(displacement5) + SOFTENING_SQ
+            distance6 = wp.length_sq(displacement6) + SOFTENING_SQ
+            distance7 = wp.length_sq(displacement7) + SOFTENING_SQ
+            distance8 = wp.length_sq(displacement8) + SOFTENING_SQ
+            distance9 = wp.length_sq(displacement9) + SOFTENING_SQ
+            distance10 = wp.length_sq(displacement10) + SOFTENING_SQ
+            distance11 = wp.length_sq(displacement11) + SOFTENING_SQ
+            distance12 = wp.length_sq(displacement12) + SOFTENING_SQ
+            distance13 = wp.length_sq(displacement13) + SOFTENING_SQ
+            distance14 = wp.length_sq(displacement14) + SOFTENING_SQ
+            distance15 = wp.length_sq(displacement15) + SOFTENING_SQ
+            distance16 = wp.length_sq(displacement16) + SOFTENING_SQ
+            distance17 = wp.length_sq(displacement17) + SOFTENING_SQ
+            distance18 = wp.length_sq(displacement18) + SOFTENING_SQ
+            distance19 = wp.length_sq(displacement19) + SOFTENING_SQ
+            distance20 = wp.length_sq(displacement20) + SOFTENING_SQ
+            distance21 = wp.length_sq(displacement21) + SOFTENING_SQ
+            distance22 = wp.length_sq(displacement22) + SOFTENING_SQ
+            distance23 = wp.length_sq(displacement23) + SOFTENING_SQ
+            distance24 = wp.length_sq(displacement24) + SOFTENING_SQ
+            distance25 = wp.length_sq(displacement25) + SOFTENING_SQ
+            distance26 = wp.length_sq(displacement26) + SOFTENING_SQ
+            distance27 = wp.length_sq(displacement27) + SOFTENING_SQ
+            distance28 = wp.length_sq(displacement28) + SOFTENING_SQ
+            distance29 = wp.length_sq(displacement29) + SOFTENING_SQ
+            distance30 = wp.length_sq(displacement30) + SOFTENING_SQ
+            distance31 = wp.length_sq(displacement31) + SOFTENING_SQ
+            root0 = wp.sqrt(distance0)
+            inverse0 = 1.0 / root0
+            cube0 = inverse0 * inverse0 * inverse0
+            root1 = wp.sqrt(distance1)
+            inverse1 = 1.0 / root1
+            cube1 = inverse1 * inverse1 * inverse1
+            root2 = wp.sqrt(distance2)
+            inverse2 = 1.0 / root2
+            cube2 = inverse2 * inverse2 * inverse2
+            root3 = wp.sqrt(distance3)
+            inverse3 = 1.0 / root3
+            cube3 = inverse3 * inverse3 * inverse3
+            root4 = wp.sqrt(distance4)
+            inverse4 = 1.0 / root4
+            cube4 = inverse4 * inverse4 * inverse4
+            root5 = wp.sqrt(distance5)
+            inverse5 = 1.0 / root5
+            cube5 = inverse5 * inverse5 * inverse5
+            root6 = wp.sqrt(distance6)
+            inverse6 = 1.0 / root6
+            cube6 = inverse6 * inverse6 * inverse6
+            root7 = wp.sqrt(distance7)
+            inverse7 = 1.0 / root7
+            cube7 = inverse7 * inverse7 * inverse7
+            root8 = wp.sqrt(distance8)
+            inverse8 = 1.0 / root8
+            cube8 = inverse8 * inverse8 * inverse8
+            root9 = wp.sqrt(distance9)
+            inverse9 = 1.0 / root9
+            cube9 = inverse9 * inverse9 * inverse9
+            root10 = wp.sqrt(distance10)
+            inverse10 = 1.0 / root10
+            cube10 = inverse10 * inverse10 * inverse10
+            root11 = wp.sqrt(distance11)
+            inverse11 = 1.0 / root11
+            cube11 = inverse11 * inverse11 * inverse11
+            root12 = wp.sqrt(distance12)
+            inverse12 = 1.0 / root12
+            cube12 = inverse12 * inverse12 * inverse12
+            root13 = wp.sqrt(distance13)
+            inverse13 = 1.0 / root13
+            cube13 = inverse13 * inverse13 * inverse13
+            root14 = wp.sqrt(distance14)
+            inverse14 = 1.0 / root14
+            cube14 = inverse14 * inverse14 * inverse14
+            root15 = wp.sqrt(distance15)
+            inverse15 = 1.0 / root15
+            cube15 = inverse15 * inverse15 * inverse15
+            root16 = wp.sqrt(distance16)
+            inverse16 = 1.0 / root16
+            cube16 = inverse16 * inverse16 * inverse16
+            root17 = wp.sqrt(distance17)
+            inverse17 = 1.0 / root17
+            cube17 = inverse17 * inverse17 * inverse17
+            root18 = wp.sqrt(distance18)
+            inverse18 = 1.0 / root18
+            cube18 = inverse18 * inverse18 * inverse18
+            root19 = wp.sqrt(distance19)
+            inverse19 = 1.0 / root19
+            cube19 = inverse19 * inverse19 * inverse19
+            root20 = wp.sqrt(distance20)
+            inverse20 = 1.0 / root20
+            cube20 = inverse20 * inverse20 * inverse20
+            root21 = wp.sqrt(distance21)
+            inverse21 = 1.0 / root21
+            cube21 = inverse21 * inverse21 * inverse21
+            root22 = wp.sqrt(distance22)
+            inverse22 = 1.0 / root22
+            cube22 = inverse22 * inverse22 * inverse22
+            root23 = wp.sqrt(distance23)
+            inverse23 = 1.0 / root23
+            cube23 = inverse23 * inverse23 * inverse23
+            root24 = wp.sqrt(distance24)
+            inverse24 = 1.0 / root24
+            cube24 = inverse24 * inverse24 * inverse24
+            root25 = wp.sqrt(distance25)
+            inverse25 = 1.0 / root25
+            cube25 = inverse25 * inverse25 * inverse25
+            root26 = wp.sqrt(distance26)
+            inverse26 = 1.0 / root26
+            cube26 = inverse26 * inverse26 * inverse26
+            root27 = wp.sqrt(distance27)
+            inverse27 = 1.0 / root27
+            cube27 = inverse27 * inverse27 * inverse27
+            root28 = wp.sqrt(distance28)
+            inverse28 = 1.0 / root28
+            cube28 = inverse28 * inverse28 * inverse28
+            root29 = wp.sqrt(distance29)
+            inverse29 = 1.0 / root29
+            cube29 = inverse29 * inverse29 * inverse29
+            root30 = wp.sqrt(distance30)
+            inverse30 = 1.0 / root30
+            cube30 = inverse30 * inverse30 * inverse30
+            root31 = wp.sqrt(distance31)
+            inverse31 = 1.0 / root31
+            cube31 = inverse31 * inverse31 * inverse31
+            acceleration += PARTICLE_MASS * cube0 * displacement0
+            acceleration += PARTICLE_MASS * cube1 * displacement1
+            acceleration += PARTICLE_MASS * cube2 * displacement2
+            acceleration += PARTICLE_MASS * cube3 * displacement3
+            acceleration += PARTICLE_MASS * cube4 * displacement4
+            acceleration += PARTICLE_MASS * cube5 * displacement5
+            acceleration += PARTICLE_MASS * cube6 * displacement6
+            acceleration += PARTICLE_MASS * cube7 * displacement7
+            acceleration += PARTICLE_MASS * cube8 * displacement8
+            acceleration += PARTICLE_MASS * cube9 * displacement9
+            acceleration += PARTICLE_MASS * cube10 * displacement10
+            acceleration += PARTICLE_MASS * cube11 * displacement11
+            acceleration += PARTICLE_MASS * cube12 * displacement12
+            acceleration += PARTICLE_MASS * cube13 * displacement13
+            acceleration += PARTICLE_MASS * cube14 * displacement14
+            acceleration += PARTICLE_MASS * cube15 * displacement15
+            acceleration += PARTICLE_MASS * cube16 * displacement16
+            acceleration += PARTICLE_MASS * cube17 * displacement17
+            acceleration += PARTICLE_MASS * cube18 * displacement18
+            acceleration += PARTICLE_MASS * cube19 * displacement19
+            acceleration += PARTICLE_MASS * cube20 * displacement20
+            acceleration += PARTICLE_MASS * cube21 * displacement21
+            acceleration += PARTICLE_MASS * cube22 * displacement22
+            acceleration += PARTICLE_MASS * cube23 * displacement23
+            acceleration += PARTICLE_MASS * cube24 * displacement24
+            acceleration += PARTICLE_MASS * cube25 * displacement25
+            acceleration += PARTICLE_MASS * cube26 * displacement26
+            acceleration += PARTICLE_MASS * cube27 * displacement27
+            acceleration += PARTICLE_MASS * cube28 * displacement28
+            acceleration += PARTICLE_MASS * cube29 * displacement29
+            acceleration += PARTICLE_MASS * cube30 * displacement30
+            acceleration += PARTICLE_MASS * cube31 * displacement31
+
+    updated_velocity = velocity[body_index] + acceleration * DT
+    velocity[body_index] = updated_velocity
+    new_position[body_index] = position + DT * updated_velocity
+
+
+def _integration_kernel(old_position, velocity, new_position, num_bodies):
+    """Select the optimized kernel for its validated native configuration."""
+    if num_bodies not in (4096, 16384):
+        return integrate_bodies_tiled
+    if DT != 0.016 or SOFTENING_SQ != 0.1**2 or TILE_SIZE != 64 or PARTICLE_MASS != 1.0:
+        return integrate_bodies_tiled
+    if SOURCE_TILE_SIZE != 256 or wp.get_module_options(integrate_bodies_tiled.module)["fast_math"]:
+        return integrate_bodies_tiled
+    arrays = (old_position, velocity, new_position)
+    device = old_position.device
+    if not device.is_cuda:
+        return integrate_bodies_tiled
+    for array in arrays:
+        if (
+            array.device != device
+            or array.dtype != wp.vec3
+            or array.shape != (num_bodies,)
+            or array.strides != (12,)
+            or array.capacity != num_bodies * 12
+            or array.requires_grad
+        ):
+            return integrate_bodies_tiled
+    spans = [(array.ptr, array.ptr + array.capacity) for array in arrays]
+    for i, (begin, end) in enumerate(spans):
+        for other_begin, other_end in spans[i + 1 :]:
+            if begin < other_end and other_begin < end:
+                return integrate_bodies_tiled
+    return _integrate_bodies_tiled_optimized
+
+
 class Example:
     def __init__(self, headless=False, num_bodies=16384):
         self.num_bodies = num_bodies
@@ -127,7 +385,7 @@ class Example:
 
     def step(self):
         wp.launch(
-            integrate_bodies_tiled,
+            _integration_kernel(self.pos_array_0, self.vel_array, self.pos_array_1, self.num_bodies),
             dim=self.num_bodies,
             inputs=[self.pos_array_0, self.vel_array, self.pos_array_1, self.num_bodies],
             block_dim=TILE_SIZE,

@@ -31,6 +31,8 @@ import tempfile
 import unittest
 from typing import Any
 
+import numpy as np
+
 import warp as wp
 import warp.tests.unittest_utils
 from warp.tests.unittest_utils import (
@@ -399,6 +401,90 @@ add_example_test(
 add_example_test(
     TestTileExamples,
     name="tile.example_tile_stream_compaction",
+    devices=cuda_test_devices,
+)
+
+
+def test_tile_nbody_optimized_step(test, device):
+    from warp.examples.tile import example_tile_nbody as nbody  # noqa: PLC0415
+
+    with wp.ScopedDevice(device):
+        for num_bodies in (4096, 16384):
+            example = nbody.Example(headless=True, num_bodies=num_bodies)
+            test.assertIs(
+                nbody._integration_kernel(example.pos_array_0, example.vel_array, example.pos_array_1, num_bodies),
+                nbody._integrate_bodies_tiled_optimized,
+            )
+            for _ in range(3):
+                old_position = wp.clone(example.pos_array_0)
+                velocity = wp.clone(example.vel_array)
+                new_position = wp.empty_like(old_position)
+                wp.launch(
+                    nbody.integrate_bodies_tiled,
+                    dim=num_bodies,
+                    inputs=[old_position, velocity, new_position, num_bodies],
+                    block_dim=nbody.TILE_SIZE,
+                )
+                example.step()
+                np.testing.assert_array_equal(example.vel_array.numpy(), velocity.numpy())
+                np.testing.assert_array_equal(example.pos_array_0.numpy(), new_position.numpy())
+                np.testing.assert_array_equal(example.pos_array_1.numpy(), old_position.numpy())
+
+
+def test_tile_nbody_dispatch_guards(test, device):
+    from warp.examples.tile import example_tile_nbody as nbody  # noqa: PLC0415
+
+    with wp.ScopedDevice(device):
+        example = nbody.Example(headless=True, num_bodies=4096)
+        arrays = (example.pos_array_0, example.vel_array, example.pos_array_1)
+        test.assertIs(nbody._integration_kernel(*arrays, 128), nbody.integrate_bodies_tiled)
+        test.assertIs(
+            nbody._integration_kernel(arrays[0], arrays[1], arrays[0], 4096),
+            nbody.integrate_bodies_tiled,
+        )
+        gradient_position = wp.empty_like(arrays[0], requires_grad=True)
+        test.assertIs(
+            nbody._integration_kernel(gradient_position, arrays[1], arrays[2], 4096),
+            nbody.integrate_bodies_tiled,
+        )
+        old_dt = nbody.DT
+        try:
+            nbody.DT = 0.032
+            test.assertIs(nbody._integration_kernel(*arrays, 4096), nbody.integrate_bodies_tiled)
+        finally:
+            nbody.DT = old_dt
+        old_options = wp.get_module_options(nbody.integrate_bodies_tiled.module).copy()
+        try:
+            wp.set_module_options({"fast_math": True}, nbody.integrate_bodies_tiled.module)
+            test.assertIs(nbody._integration_kernel(*arrays, 4096), nbody.integrate_bodies_tiled)
+        finally:
+            wp.set_module_options(old_options, nbody.integrate_bodies_tiled.module)
+        test.assertEqual(wp.get_module_options(nbody._integrate_bodies_tiled_optimized.module)["max_unroll"], 1)
+        test.assertFalse(wp.get_module_options(nbody._integrate_bodies_tiled_optimized.module)["enable_backward"])
+
+
+class TestTileNbodyDispatch(unittest.TestCase):
+    def test_cpu_uses_original(self):
+        from warp.examples.tile import example_tile_nbody as nbody  # noqa: PLC0415
+
+        with wp.ScopedDevice("cpu"):
+            example = nbody.Example(headless=True, num_bodies=4096)
+            self.assertIs(
+                nbody._integration_kernel(example.pos_array_0, example.vel_array, example.pos_array_1, 4096),
+                nbody.integrate_bodies_tiled,
+            )
+
+
+add_function_test(
+    TestTileExamples,
+    "test_tile_nbody_optimized_step",
+    test_tile_nbody_optimized_step,
+    devices=cuda_test_devices,
+)
+add_function_test(
+    TestTileExamples,
+    "test_tile_nbody_dispatch_guards",
+    test_tile_nbody_dispatch_guards,
     devices=cuda_test_devices,
 )
 
